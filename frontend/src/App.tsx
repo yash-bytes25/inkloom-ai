@@ -22,6 +22,8 @@ import {
   XCircle,
   Plus,
   RefreshCw,
+  Database,
+  GitCompare,
 } from 'lucide-react'
 import type {
   Finding,
@@ -33,8 +35,17 @@ import type {
   ReviewStatus,
   DecisionType,
 } from './types/governance'
+import { BrandGuidelinesEditor } from './components/BrandGuidelinesEditor'
+import { RevisionDiffViewer } from './components/RevisionDiffViewer'
+import {
+  getStoredSession,
+  saveSession,
+  clearSession,
+  getAuthHeaders,
+  type AuthSession,
+} from './utils/auth'
 
-const API_BASE = 'http://127.0.0.1:8000'
+const API_BASE = (import.meta.env.VITE_API_URL as string) || 'http://127.0.0.1:8000'
 
 const SAMPLE_COPY_OPTIONS = [
   {
@@ -59,11 +70,20 @@ export function App() {
   const [submissionTitle, setSubmissionTitle] = useState<string>('')
   const [reviewerComment, setReviewerComment] = useState<string>('')
   const [commentError, setCommentError] = useState<string | null>(null)
-  const [activeTab, setActiveTab] = useState<'audit' | 'workflow'>('audit')
+  const [activeTab, setActiveTab] = useState<'audit' | 'workflow' | 'diff' | 'guidelines'>('audit')
   const [showNewModal, setShowNewModal] = useState<boolean>(false)
   const [newTitle, setNewTitle] = useState<string>('')
   const [newContent, setNewContent] = useState<string>('')
   const [expandedSnapshotId, setExpandedSnapshotId] = useState<string | null>(null)
+  const [includeAi, setIncludeAi] = useState<boolean>(true)
+
+  // Authentication & Session State
+  const [session, setSession] = useState<AuthSession | null>(getStoredSession())
+  const [showAuthModal, setShowAuthModal] = useState<boolean>(false)
+  const [authEmail, setAuthEmail] = useState<string>('')
+  const [authPassword, setAuthPassword] = useState<string>('')
+  const [authLoading, setAuthLoading] = useState<boolean>(false)
+  const [authError, setAuthError] = useState<string | null>(null)
 
   // Policy Review & System State
   const [reviewResult, setReviewResult] = useState<ReviewResponse | null>(null)
@@ -71,23 +91,102 @@ export function App() {
   const [loading, setLoading] = useState<boolean>(false)
   const [actionLoading, setActionLoading] = useState<boolean>(false)
   const [backendOnline, setBackendOnline] = useState<boolean>(false)
+  const [storageMode, setStorageMode] = useState<'supabase_persistent' | 'local_demo'>('local_demo')
   const [showRulesDrawer, setShowRulesDrawer] = useState<boolean>(false)
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
   const [successMsg, setSuccessMsg] = useState<string | null>(null)
 
-  // Standalone or local deterministic policy evaluation
-  const runAudit = async (textToReview?: string) => {
+  // Authenticated API request wrapper
+  const apiFetch = async (
+    endpoint: string,
+    options: RequestInit = {},
+    overrideSession?: AuthSession | null
+  ): Promise<Response> => {
+    const currentSession = overrideSession !== undefined ? overrideSession : session
+    const authHeaders = getAuthHeaders(currentSession)
+    const response = await fetch(`${API_BASE}${endpoint}`, {
+      ...options,
+      headers: {
+        ...(options.headers || {}),
+        ...authHeaders,
+      },
+    })
+
+    if (response.status === 401 && currentSession) {
+      clearSession()
+      setSession(null)
+      setErrorMsg('Your authenticated session has expired or is invalid. Switched to local unauthenticated mode.')
+    }
+
+    return response
+  }
+
+  // Handle Authentication (Supabase Cloud password login or Local Demo Persona)
+  const handleLogin = async (e?: React.FormEvent, personaEmail?: string) => {
+    if (e) e.preventDefault()
+    setAuthLoading(true)
+    setAuthError(null)
+
+    const emailToUse = personaEmail || authEmail.trim()
+    const passwordToUse = personaEmail ? 'demo-password' : authPassword
+
+    if (!emailToUse) {
+      setAuthError('Email is required.')
+      setAuthLoading(false)
+      return
+    }
+
+    try {
+      const res = await fetch(`${API_BASE}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: emailToUse, password: passwordToUse }),
+      })
+
+      if (!res.ok) {
+        const errJson = await res.json().catch(() => ({}))
+        throw new Error(errJson.detail || `Authentication failed (${res.status})`)
+      }
+
+      const data: AuthSession = await res.json()
+      saveSession(data)
+      setSession(data)
+      setShowAuthModal(false)
+      setAuthEmail('')
+      setAuthPassword('')
+      setSuccessMsg(`Signed in as ${data.user.email}`)
+      setTimeout(() => setSuccessMsg(null), 3000)
+      await bootstrap(data)
+    } catch (err: unknown) {
+      setAuthError(err instanceof Error ? err.message : 'Authentication failed')
+    } finally {
+      setAuthLoading(false)
+    }
+  }
+
+  const handleLogout = () => {
+    clearSession()
+    setSession(null)
+    setSuccessMsg('Signed out successfully.')
+    setTimeout(() => setSuccessMsg(null), 3000)
+    bootstrap(null)
+  }
+
+  // Standalone or combined review evaluation
+  const runAudit = async (textToReview?: string, overrideAi?: boolean) => {
     const targetText = textToReview !== undefined ? textToReview : content
+    const shouldRunAi = overrideAi !== undefined ? overrideAi : includeAi
     setLoading(true)
     setErrorMsg(null)
 
     try {
-      const response = await fetch(`${API_BASE}/api/review`, {
+      const response = await apiFetch('/api/review', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           text: targetText,
           rules: null,
+          include_ai: shouldRunAi,
         }),
       })
 
@@ -108,9 +207,9 @@ export function App() {
     }
   }
 
-  const refreshSubmissions = async (preferredId?: string) => {
+  const refreshSubmissions = async (preferredId?: string, activeSession?: AuthSession | null) => {
     try {
-      const res = await fetch(`${API_BASE}/api/submissions`)
+      const res = await apiFetch('/api/submissions', {}, activeSession)
       if (res.ok) {
         const list: Submission[] = await res.json()
         setSubmissions(list)
@@ -128,11 +227,11 @@ export function App() {
           if (target.latest_review_response) {
             setReviewResult(target.latest_review_response)
           } else {
-            runAudit(target.content)
+            runAudit(target.content, false)
           }
         } else {
           setContent(SAMPLE_COPY_OPTIONS[0].text)
-          runAudit(SAMPLE_COPY_OPTIONS[0].text)
+          runAudit(SAMPLE_COPY_OPTIONS[0].text, false)
         }
       }
     } catch {
@@ -140,22 +239,95 @@ export function App() {
     }
   }
 
-  const bootstrap = async () => {
+  const bootstrap = async (overrideSession?: AuthSession | null) => {
+    const activeSession = overrideSession !== undefined ? overrideSession : session
     try {
       const healthRes = await fetch(`${API_BASE}/api/health`)
       if (healthRes.ok) {
         setBackendOnline(true)
-        const rulesRes = await fetch(`${API_BASE}/api/demo-rules`)
+        const healthData = await healthRes.json().catch(() => ({}))
+        if (healthData.storage_mode) {
+          setStorageMode(healthData.storage_mode)
+        }
+
+        // Verify active session with backend if present
+        if (activeSession?.access_token) {
+          try {
+            const meRes = await apiFetch('/api/auth/me', {}, activeSession)
+            if (meRes.ok) {
+              const meData = await meRes.json()
+              if (meData.role && meData.role !== activeSession.role) {
+                const updatedSession = { ...activeSession, role: meData.role }
+                saveSession(updatedSession)
+                setSession(updatedSession)
+              }
+            }
+          } catch {
+            // Error handled in apiFetch
+          }
+        }
+
+        const rulesRes = await apiFetch('/api/guidelines', {}, activeSession).catch(() =>
+          fetch(`${API_BASE}/api/demo-rules`)
+        )
         if (rulesRes.ok) {
           const rulesData: BrandRulesConfig = await rulesRes.json()
           setDemoRules(rulesData)
         }
-        await refreshSubmissions()
+        await refreshSubmissions(undefined, activeSession)
       } else {
         setBackendOnline(false)
       }
     } catch {
       setBackendOnline(false)
+    }
+  }
+
+  const handleSaveGuidelines = async (updatedRules: BrandRulesConfig) => {
+    setActionLoading(true)
+    setErrorMsg(null)
+    try {
+      const res = await apiFetch('/api/guidelines', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updatedRules),
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        throw new Error(err.detail || 'Failed to update brand guidelines')
+      }
+      const savedData: BrandRulesConfig = await res.json()
+      setDemoRules(savedData)
+      setSuccessMsg(`Brand guidelines for "${savedData.brand_name}" updated successfully.`)
+      setTimeout(() => setSuccessMsg(null), 4000)
+      if (content) {
+        runAudit(content, includeAi)
+      }
+    } finally {
+      setActionLoading(false)
+    }
+  }
+
+  const handleResetGuidelines = async () => {
+    setActionLoading(true)
+    setErrorMsg(null)
+    try {
+      const res = await apiFetch('/api/guidelines/reset', {
+        method: 'POST',
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        throw new Error(err.detail || 'Failed to reset brand guidelines')
+      }
+      const resetData: BrandRulesConfig = await res.json()
+      setDemoRules(resetData)
+      setSuccessMsg('Restored original NovaSound Audio demo rules.')
+      setTimeout(() => setSuccessMsg(null), 4000)
+      if (content) {
+        runAudit(content, includeAi)
+      }
+    } finally {
+      setActionLoading(false)
     }
   }
 
@@ -176,10 +348,12 @@ export function App() {
     if (sub.latest_review_response) {
       setReviewResult(sub.latest_review_response)
     } else {
-      runAudit(sub.content)
+      runAudit(sub.content, false)
     }
   }
 
+  // Save changes to active submission.
+  // Note: If content changed, backend resets status to 'draft', increments version, and invalidates previous approvals.
   // Save changes to active submission.
   // Note: If content changed, backend resets status to 'draft', increments version, and invalidates previous approvals.
   const handleSaveSubmission = async () => {
@@ -189,7 +363,7 @@ export function App() {
     setSuccessMsg(null)
 
     try {
-      const res = await fetch(`${API_BASE}/api/submissions/${activeSubmission.id}`, {
+      const res = await apiFetch(`/api/submissions/${activeSubmission.id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -211,7 +385,6 @@ export function App() {
         setReviewResult(updated.latest_review_response)
       }
 
-      // Update list
       setSubmissions((prev) => prev.map((s) => (s.id === updated.id ? updated : s)))
 
       if (updated.version > activeSubmission.version) {
@@ -238,7 +411,7 @@ export function App() {
     try {
       // If content was modified, save it first so submission is evaluated on latest copy
       if (content !== activeSubmission.content) {
-        await fetch(`${API_BASE}/api/submissions/${activeSubmission.id}`, {
+        await apiFetch(`/api/submissions/${activeSubmission.id}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -248,11 +421,12 @@ export function App() {
         })
       }
 
-      const res = await fetch(`${API_BASE}/api/submissions/${activeSubmission.id}/submit`, {
+      const creatorName = session ? session.user.email : activeSubmission.creator_name
+      const res = await apiFetch(`/api/submissions/${activeSubmission.id}/submit`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          creator_name: activeSubmission.creator_name,
+          creator_name: creatorName,
         }),
       })
 
@@ -277,6 +451,37 @@ export function App() {
     }
   }
 
+  // Trigger combined Gemini AI contextual audit on active submission
+  const handleRunAiSubmissionAudit = async () => {
+    if (!activeSubmission) return
+    setActionLoading(true)
+    setErrorMsg(null)
+    setSuccessMsg(null)
+
+    try {
+      const res = await apiFetch(`/api/submissions/${activeSubmission.id}/ai-audit`, {
+        method: 'POST',
+      })
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}))
+        throw new Error(errData.detail || `AI audit failed (${res.status})`)
+      }
+
+      const updated: Submission = await res.json()
+      setActiveSubmission(updated)
+      if (updated.latest_review_response) {
+        setReviewResult(updated.latest_review_response)
+      }
+      setSubmissions((prev) => prev.map((s) => (s.id === updated.id ? updated : s)))
+      setSuccessMsg(`Gemini AI contextual review completed on v${updated.version}.`)
+      setActiveTab('audit')
+    } catch (err: unknown) {
+      setErrorMsg(err instanceof Error ? err.message : 'Error running AI audit')
+    } finally {
+      setActionLoading(false)
+    }
+  }
+
   // Reviewer records decision: approved, changes_requested, or rejected
   const handleRecordDecision = async (decision: DecisionType) => {
     if (!activeSubmission) return
@@ -295,14 +500,16 @@ export function App() {
 
     setActionLoading(true)
     try {
-      const res = await fetch(`${API_BASE}/api/submissions/${activeSubmission.id}/decision`, {
+      const reviewerName = session ? session.user.email : 'Alex Morgan (Demo Brand Guardian)'
+      const isDemoReviewer = session ? session.is_demo : true
+      const res = await apiFetch(`/api/submissions/${activeSubmission.id}/decision`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           decision,
-          reviewer_name: 'Alex Morgan (Demo Brand Guardian)',
-          is_demo_reviewer: true,
-          comment: reviewerComment.trim() || (decision === 'approved' ? 'Approved — fully brand compliant.' : ''),
+          reviewer_name: reviewerName,
+          is_demo_reviewer: isDemoReviewer,
+          comment: reviewerComment.trim() || (decision === 'approved' ? 'Approved — certified brand compliant.' : ''),
         }),
       })
 
@@ -334,14 +541,16 @@ export function App() {
     }
     setActionLoading(true)
     try {
-      const res = await fetch(`${API_BASE}/api/submissions`, {
+      const creatorName = session ? session.user.email : 'Jordan Lee (Demo Creator)'
+      const isDemoCreator = session ? session.is_demo : true
+      const res = await apiFetch('/api/submissions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           title: newTitle.trim() || 'New Campaign Copy',
           content: newContent,
-          creator_name: 'Jordan Lee (Demo Creator)',
-          is_demo_creator: true,
+          creator_name: creatorName,
+          is_demo_creator: isDemoCreator,
         }),
       })
 
@@ -360,7 +569,51 @@ export function App() {
     }
   }
 
-  // Quick fix: Apply suggested correction to the active content text
+  // Quick demo action to generate v2 with brand fixes applied
+  const handleGenerateSampleRevision = async () => {
+    if (!activeSubmission) return
+    setActionLoading(true)
+    setErrorMsg(null)
+    setSuccessMsg(null)
+
+    try {
+      const revisedContent = activeSubmission.content
+        .replace(/cheap headphones/gi, 'accessible high-fidelity audio')
+        .replace(/\$199/g, '$299')
+        .replace(/kills the competition/gi, 'leads the industry in acoustic clarity')
+        .replace(/unbreakable build/gi, 'aerospace-grade aluminum durability')
+
+      const res = await apiFetch(`/api/submissions/${activeSubmission.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          content: revisedContent,
+          title: activeSubmission.title,
+        }),
+      })
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        throw new Error(err.detail || 'Failed to create revision')
+      }
+
+      const updated: Submission = await res.json()
+      setActiveSubmission(updated)
+      setContent(updated.content)
+      if (updated.latest_review_response) {
+        setReviewResult(updated.latest_review_response)
+      }
+      setSubmissions((prev) => prev.map((s) => (s.id === updated.id ? updated : s)))
+      setSuccessMsg(`Revision v${updated.version} created with applied brand fixes. Compare with v${updated.version - 1} below.`)
+      setActiveTab('diff')
+    } catch (err: unknown) {
+      setErrorMsg(err instanceof Error ? err.message : 'Error generating sample revision')
+    } finally {
+      setActionLoading(false)
+    }
+  }
+
+  // Quick fix: Apply suggested correction to active content text
   const applyCorrection = (finding: Finding) => {
     if (!finding.suggested_correction) return
 
@@ -473,8 +726,16 @@ export function App() {
         return 'Approved Fact Contradiction'
       case 'required_disclaimer':
         return 'Mandatory Disclaimer'
+      case 'brand_tone':
+        return 'Brand Tone & Voice'
+      case 'contextual_messaging':
+        return 'Contextual Messaging'
+      case 'unsupported_claim':
+        return 'Unsupported Claim'
+      case 'nuanced_inconsistency':
+        return 'Nuanced Inconsistency'
       default:
-        return cat
+        return cat.replace('_', ' ')
     }
   }
 
@@ -494,19 +755,36 @@ export function App() {
               <div className="flex items-center gap-2">
                 <span className="font-bold text-lg text-white tracking-tight">Inkloom AI</span>
                 <span className="text-[10px] uppercase font-mono px-2 py-0.5 rounded-full bg-slate-800 text-emerald-400 border border-slate-700">
-                  Governance Platform
+                  Deterministic Engine
                 </span>
-                <span className="text-[10px] uppercase font-mono px-2 py-0.5 rounded-full bg-slate-800 text-sky-400 border border-slate-700">
-                  Human-In-The-Loop
+                <span className="text-[10px] uppercase font-mono px-2 py-0.5 rounded-full bg-sky-950 text-sky-400 border border-sky-800 flex items-center gap-1">
+                  <Sparkles className="w-2.5 h-2.5" />
+                  Gemini AI
                 </span>
               </div>
               <p className="text-xs text-slate-400">
-                Deterministic Policy Audit & Full Human Review Lifecycle State Machine
+                Hybrid Brand Governance: Rule Policy Auditor &bull; Gemini Contextual Analysis &bull; Human Review State Machine
               </p>
             </div>
           </div>
 
           <div className="flex items-center gap-3">
+            {/* Storage Mode Badge */}
+            <div
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-medium ${
+                storageMode === 'supabase_persistent'
+                  ? 'bg-emerald-950/60 border-emerald-800 text-emerald-300'
+                  : 'bg-amber-950/40 border-amber-800/60 text-amber-300'
+              }`}
+            >
+              <Database className="w-3.5 h-3.5" />
+              <span>
+                {storageMode === 'supabase_persistent'
+                  ? 'Supabase PostgreSQL (RLS)'
+                  : 'Local Demo (In-Memory)'}
+              </span>
+            </div>
+
             {/* Backend connectivity */}
             <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-800 text-xs text-slate-300">
               <span
@@ -526,6 +804,38 @@ export function App() {
               <span>Guidelines {demoRules?.is_demo && '(NovaSound Demo)'}</span>
               {showRulesDrawer ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
             </button>
+
+            {/* User Session / Sign In Trigger */}
+            <div className="flex items-center gap-2 pl-2 border-l border-slate-800">
+              {session ? (
+                <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-800 text-xs text-slate-200">
+                    <UserCheck className="w-3.5 h-3.5 text-emerald-400" />
+                    <span className="font-medium max-w-[150px] truncate">{session.user.email}</span>
+                    {session.role && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-950/80 text-emerald-300 border border-emerald-800 font-mono uppercase">
+                        {session.role}
+                      </span>
+                    )}
+                  </div>
+                  <button
+                    onClick={handleLogout}
+                    className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-750 text-xs text-slate-300 border border-slate-700 transition cursor-pointer"
+                    title="Sign Out"
+                  >
+                    Sign Out
+                  </button>
+                </div>
+              ) : (
+                <button
+                  onClick={() => setShowAuthModal(true)}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-xs font-semibold text-white transition shadow-sm cursor-pointer"
+                >
+                  <UserCheck className="w-3.5 h-3.5" />
+                  <span>Sign In</span>
+                </button>
+              )}
+            </div>
           </div>
         </div>
       </header>
@@ -542,7 +852,7 @@ export function App() {
                   Active Policy Config: {demoRules.brand_name}
                 </h3>
                 <p className="text-xs text-slate-400 mt-0.5">
-                  Deterministic rules loaded into the local engine (Sample fictional brand for Round 2)
+                  Deterministic rules and certified facts loaded into the local engine
                 </p>
               </div>
               <span className="text-[11px] px-2 py-0.5 rounded bg-amber-500/10 text-amber-300 border border-amber-500/20 font-medium">
@@ -626,6 +936,16 @@ export function App() {
         {/* WORKFLOW LIFECYCLE BAR: Active Submission & State   */}
         {/* ==================================================== */}
         <section className="p-4 md:p-5 rounded-2xl bg-gradient-to-r from-slate-900 via-slate-900/90 to-slate-850 border border-slate-800 shadow-xl space-y-3">
+          {storageMode === 'local_demo' && (
+            <div className="flex items-center justify-between px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/20 text-xs text-amber-300">
+              <div className="flex items-center gap-2">
+                <Info className="w-4 h-4 text-amber-400 flex-shrink-0" />
+                <span>
+                  <strong>Demo Mode:</strong> Submissions are stored in local memory and reset upon server restart. Configure <code>SUPABASE_URL</code> and <code>SUPABASE_ANON_KEY</code> to enable persistent PostgreSQL storage with Row-Level Security.
+                </span>
+              </div>
+            </div>
+          )}
           <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
             {/* Left: Submission Selection & Metadata */}
             <div className="flex items-center gap-3 flex-wrap">
@@ -664,11 +984,22 @@ export function App() {
                   <span className="text-xs px-2 py-0.5 rounded bg-slate-800/80 text-slate-400 border border-slate-700/60 font-mono">
                     ID: {activeSubmission.id}
                   </span>
+                  <span
+                    className={`text-[11px] px-2 py-0.5 rounded border font-medium ${
+                      activeSubmission.storage_mode === 'supabase_persistent'
+                        ? 'bg-emerald-950/60 text-emerald-300 border-emerald-800'
+                        : 'bg-amber-950/40 text-amber-300 border-amber-800/60'
+                    }`}
+                  >
+                    {activeSubmission.storage_mode === 'supabase_persistent'
+                      ? 'PostgreSQL Persistent'
+                      : 'Demo In-Memory'}
+                  </span>
                 </div>
               )}
             </div>
 
-            {/* Right: Identities & Creator Action */}
+            {/* Right: Identities, Gemini Audit & Creator Action */}
             <div className="flex items-center gap-3 flex-wrap">
               <div className="flex items-center gap-2 text-xs text-slate-400">
                 <span className="flex items-center gap-1 text-slate-300">
@@ -685,6 +1016,20 @@ export function App() {
                   <span className="font-medium text-slate-200">Alex Morgan (Demo Brand Guardian)</span>
                 </span>
               </div>
+
+              {/* Gemini Submission Audit Button */}
+              {activeSubmission && (
+                <button
+                  type="button"
+                  onClick={handleRunAiSubmissionAudit}
+                  disabled={actionLoading}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-sky-500/15 hover:bg-sky-500/25 text-sky-300 border border-sky-500/30 text-xs font-semibold transition cursor-pointer"
+                  title="Execute Gemini AI contextual audit on this submission copy"
+                >
+                  <Sparkles className={`w-3.5 h-3.5 ${actionLoading ? 'animate-spin' : ''}`} />
+                  Gemini Audit
+                </button>
+              )}
 
               {/* Creator Submit for Review Button */}
               {activeSubmission && (
@@ -719,7 +1064,7 @@ export function App() {
               <AlertTriangle className="w-4 h-4 shrink-0 text-amber-400 mt-0.5" />
               <div>
                 <span className="font-semibold text-amber-200">Content Modified Post-Approval:</span>{' '}
-                Previous approval is locked to v{activeSubmission?.version} snapshot. Saving these edits will
+                Previous approval is locked to v{activeSubmission?.version} snapshot. Saving these modifications will
                 increment version to v{(activeSubmission?.version || 1) + 1}, reset status to Draft, and require
                 a fresh human review cycle before publication.
               </div>
@@ -825,19 +1170,33 @@ export function App() {
                 className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3.5 text-sm text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 font-mono transition leading-relaxed resize-y"
               />
 
-              {/* Action Buttons */}
+              {/* Action Buttons & AI Toggle */}
               <div className="flex items-center justify-between pt-2 flex-wrap gap-2">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setContent('')
-                    setReviewResult(null)
-                  }}
-                  className="text-xs text-slate-400 hover:text-slate-200 flex items-center gap-1 transition cursor-pointer"
-                >
-                  <RotateCcw className="w-3 h-3" />
-                  Clear
-                </button>
+                <div className="flex items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setContent('')
+                      setReviewResult(null)
+                    }}
+                    className="text-xs text-slate-400 hover:text-slate-200 flex items-center gap-1 transition cursor-pointer"
+                  >
+                    <RotateCcw className="w-3 h-3" />
+                    Clear
+                  </button>
+
+                  {/* AI toggle checkbox */}
+                  <label className="flex items-center gap-1.5 text-xs text-slate-300 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={includeAi}
+                      onChange={(e) => setIncludeAi(e.target.checked)}
+                      className="rounded border-slate-700 bg-slate-950 text-sky-500 focus:ring-0 focus:ring-offset-0 cursor-pointer"
+                    />
+                    <Sparkles className={`w-3.5 h-3.5 ${includeAi ? 'text-sky-400' : 'text-slate-500'}`} />
+                    <span>Gemini AI</span>
+                  </label>
+                </div>
 
                 <div className="flex items-center gap-2">
                   {activeSubmission && isContentDirty && (
@@ -859,7 +1218,7 @@ export function App() {
                     className="flex items-center gap-2 px-4 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-semibold text-xs tracking-wide shadow-lg shadow-emerald-500/20 transition cursor-pointer"
                   >
                     <Sparkles className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
-                    {loading ? 'Auditing Policy...' : 'Run Policy Audit'}
+                    {loading ? 'Evaluating Policy...' : includeAi ? 'Run Audit + Gemini AI' : 'Run Deterministic Audit'}
                   </button>
                 </div>
               </div>
@@ -942,6 +1301,45 @@ export function App() {
                     </span>
                   )}
                 </button>
+
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('diff')}
+                  className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-semibold transition cursor-pointer ${
+                    activeTab === 'diff'
+                      ? 'bg-slate-800 text-white border border-slate-700'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  <GitCompare className="w-3.5 h-3.5 text-sky-400" />
+                  Compare Revisions
+                  {activeSubmission && (
+                    <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-sky-500/20 text-sky-300 font-mono">
+                      v{activeSubmission.version}
+                    </span>
+                  )}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('guidelines')}
+                  className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-semibold transition cursor-pointer ${
+                    activeTab === 'guidelines'
+                      ? 'bg-slate-800 text-white border border-slate-700'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  <BookOpen className="w-3.5 h-3.5 text-emerald-400" />
+                  Guidelines Editor
+                  {demoRules && (
+                    <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-slate-700 text-slate-300 font-mono">
+                      {demoRules.prohibited_terms.length +
+                        demoRules.preferred_wording.length +
+                        demoRules.approved_facts.length +
+                        demoRules.required_disclaimers.length}
+                    </span>
+                  )}
+                </button>
               </div>
 
               {activeSubmission?.status === 'in_review' && (
@@ -952,7 +1350,7 @@ export function App() {
               )}
             </div>
 
-            {/* TAB 1: Deterministic Policy Audit */}
+            {/* TAB 1: Hybrid Policy Audit (Deterministic + Gemini AI) */}
             {activeTab === 'audit' && (
               <div className="space-y-4">
                 {reviewResult ? (
@@ -1003,6 +1401,50 @@ export function App() {
                       </div>
                     </div>
 
+                    {/* Gemini AI Status Card */}
+                    {reviewResult.ai_status === 'completed' && (
+                      <div className="p-4 rounded-xl bg-gradient-to-r from-sky-950/40 via-slate-900 to-indigo-950/30 border border-sky-500/30 space-y-1.5 animate-in fade-in">
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <Sparkles className="w-4 h-4 text-sky-400" />
+                            <span className="text-xs font-bold text-white">Gemini Contextual AI Analysis</span>
+                            <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-sky-900/60 text-sky-300 border border-sky-700">
+                              {reviewResult.ai_model || 'gemini-2.5-flash'}
+                            </span>
+                          </div>
+                          <span className="text-[11px] text-slate-400">
+                            {reviewResult.deterministic_count ?? 0} rule &bull; {reviewResult.ai_count ?? 0} AI findings
+                          </span>
+                        </div>
+                        {reviewResult.ai_summary && (
+                          <p className="text-xs text-slate-300 leading-relaxed font-sans italic">
+                            "{reviewResult.ai_summary}"
+                          </p>
+                        )}
+                      </div>
+                    )}
+
+                    {reviewResult.ai_status === 'unavailable' && (
+                      <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/20 text-xs text-amber-300 flex items-start gap-2">
+                        <Info className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                        <div>
+                          <span className="font-semibold text-amber-200">Gemini AI Analysis Unavailable:</span>{' '}
+                          {reviewResult.ai_error || 'GEMINI_API_KEY environment variable is not configured on the backend.'}{' '}
+                          Deterministic rule engine evaluated successfully.
+                        </div>
+                      </div>
+                    )}
+
+                    {reviewResult.ai_status === 'failed' && (
+                      <div className="p-3 rounded-xl bg-rose-500/10 border border-rose-500/20 text-xs text-rose-300 flex items-start gap-2">
+                        <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                        <div>
+                          <span className="font-semibold text-rose-200">Gemini AI Analysis Notice:</span>{' '}
+                          {reviewResult.ai_error}. Deterministic findings are preserved.
+                        </div>
+                      </div>
+                    )}
+
                     {/* Findings list */}
                     {reviewResult.findings.length === 0 ? (
                       <div className="p-8 text-center rounded-2xl bg-slate-900/40 border border-slate-800/80 space-y-2">
@@ -1010,7 +1452,7 @@ export function App() {
                         <h5 className="text-sm font-semibold text-slate-200">No Policy Violations Found</h5>
                         <p className="text-xs text-slate-400 max-w-md mx-auto">
                           Submitted copy adheres strictly to prohibited vocabulary rules, approved fact assertions,
-                          required regulatory disclaimers, and preferred terminology.
+                          required regulatory disclaimers, brand tone, and preferred terminology.
                         </p>
                       </div>
                     ) : (
@@ -1022,10 +1464,29 @@ export function App() {
                           >
                             {/* Badges */}
                             <div className="flex items-center justify-between flex-wrap gap-2">
-                              <div className="flex items-center gap-2">
+                              <div className="flex items-center gap-2 flex-wrap">
                                 <span className="text-xs font-mono font-bold text-slate-400">
                                   {finding.id}
                                 </span>
+
+                                {/* Source badge: Deterministic vs Gemini AI */}
+                                {finding.source === 'gemini_ai' ? (
+                                  <span className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded bg-sky-500/15 text-sky-300 border border-sky-500/30 font-medium">
+                                    <Sparkles className="w-3 h-3 text-sky-400" />
+                                    Gemini AI Contextual
+                                    {finding.confidence !== undefined && finding.confidence !== null && (
+                                      <span className="text-[10px] opacity-80 font-mono">
+                                        ({Math.round(finding.confidence * 100)}%)
+                                      </span>
+                                    )}
+                                  </span>
+                                ) : (
+                                  <span className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-300 border border-emerald-500/20 font-medium">
+                                    <ShieldCheck className="w-3 h-3 text-emerald-400" />
+                                    Deterministic Rule
+                                  </span>
+                                )}
+
                                 <span className="text-xs font-medium text-slate-300 bg-slate-800 px-2 py-0.5 rounded">
                                   {getCategoryLabel(finding.category)}
                                 </span>
@@ -1087,7 +1548,7 @@ export function App() {
                     <h4 className="text-sm font-semibold text-slate-300">Ready for Governance Review</h4>
                     <p className="text-xs text-slate-400 max-w-md mx-auto">
                       Click "Run Policy Audit" above or choose a sample scenario to evaluate content against active
-                      prohibited terms, certified facts, and mandatory disclaimers.
+                      prohibited terms, certified facts, mandatory disclaimers, and contextual brand tone.
                     </p>
                   </div>
                 )}
@@ -1109,7 +1570,20 @@ export function App() {
                         Brand Guardian: Alex Morgan (Certified Reviewer &bull; Demo Identity)
                       </p>
                     </div>
-                    {activeSubmission && getStatusBadge(activeSubmission.status, activeSubmission.version)}
+                    <div className="flex items-center gap-2">
+                      {activeSubmission && getStatusBadge(activeSubmission.status, activeSubmission.version)}
+                      {activeSubmission && activeSubmission.version > 1 && (
+                        <button
+                          type="button"
+                          onClick={() => setActiveTab('diff')}
+                          className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-sky-500/10 hover:bg-sky-500/20 text-sky-300 border border-sky-500/30 text-xs font-semibold transition cursor-pointer"
+                          title="View revision diff"
+                        >
+                          <GitCompare className="w-3.5 h-3.5 text-sky-400" />
+                          Compare Revisions
+                        </button>
+                      )}
+                    </div>
                   </div>
 
                   {/* Decision Guidance State */}
@@ -1121,7 +1595,7 @@ export function App() {
                       </div>
                       <p className="text-slate-400">
                         Content must be submitted by the creator (status must be 'In Review') before an approval,
-                        change request, or rejection can be recorded.
+                        change request, or rejection can be recorded. AI analysis advises human reviewers but never approves automatically.
                       </p>
                       {activeSubmission?.status === 'draft' && (
                         <button
@@ -1333,6 +1807,27 @@ export function App() {
                 </div>
               </div>
             )}
+
+            {/* TAB 3: Compare Revisions & Diff View */}
+            {activeTab === 'diff' && activeSubmission && (
+              <RevisionDiffViewer
+                submission={activeSubmission}
+                apiBase={API_BASE}
+                authHeaders={getAuthHeaders(session)}
+                onApplyFix={applyCorrection}
+                onGenerateSampleRevision={handleGenerateSampleRevision}
+              />
+            )}
+
+            {/* TAB 4: Brand Guidelines & Policy Editor */}
+            {activeTab === 'guidelines' && demoRules && (
+              <BrandGuidelinesEditor
+                initialRules={demoRules}
+                onSave={handleSaveGuidelines}
+                onReset={handleResetGuidelines}
+                isSaving={actionLoading}
+              />
+            )}
           </div>
         </div>
       </main>
@@ -1406,11 +1901,135 @@ export function App() {
         </div>
       )}
 
+      {/* Auth Modal */}
+      {showAuthModal && (
+        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-md w-full p-6 shadow-2xl relative space-y-4">
+            <button
+              onClick={() => {
+                setShowAuthModal(false)
+                setAuthError(null)
+              }}
+              className="absolute top-4 right-4 text-slate-400 hover:text-white transition cursor-pointer"
+            >
+              <X className="w-5 h-5" />
+            </button>
+
+            <div className="flex items-center gap-3">
+              <div className="p-2.5 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400">
+                <ShieldCheck className="w-6 h-6" />
+              </div>
+              <div>
+                <h3 className="text-base font-semibold text-white">Inkloom Authentication</h3>
+                <p className="text-xs text-slate-400">
+                  {storageMode === 'supabase_persistent'
+                    ? 'Sign in with your Supabase credentials'
+                    : 'Select a demo persona or sign in with Supabase'}
+                </p>
+              </div>
+            </div>
+
+            {authError && (
+              <div className="p-3 rounded-lg bg-rose-500/10 border border-rose-500/20 text-rose-300 text-xs flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 flex-shrink-0" />
+                <span>{authError}</span>
+              </div>
+            )}
+
+            {/* Quick Demo Switcher when running in Local Demo Mode */}
+            {storageMode === 'local_demo' && (
+              <div className="space-y-2 p-3 rounded-xl bg-slate-950 border border-slate-800">
+                <p className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+                  <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+                  Local Demo Mode Personas:
+                </p>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => handleLogin(undefined, 'jordan.lee@novasound.example')}
+                    className="p-2 text-left rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 text-xs transition cursor-pointer"
+                  >
+                    <p className="font-semibold text-white">Jordan Lee</p>
+                    <p className="text-[10px] text-slate-400">Creator</p>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleLogin(undefined, 'alex.rivera@novasound.example')}
+                    className="p-2 text-left rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 text-xs transition cursor-pointer"
+                  >
+                    <p className="font-semibold text-white">Alex Rivera</p>
+                    <p className="text-[10px] text-amber-400 font-medium">Reviewer</p>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleLogin(undefined, 'morgan.vance@novasound.example')}
+                    className="p-2 text-left rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 text-xs transition cursor-pointer"
+                  >
+                    <p className="font-semibold text-white">Morgan Vance</p>
+                    <p className="text-[10px] text-sky-400 font-medium">Admin / Owner</p>
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Standard Credential Form */}
+            <form onSubmit={handleLogin} className="space-y-3 pt-1">
+              <div>
+                <label className="block text-xs font-medium text-slate-300 mb-1">Email Address</label>
+                <input
+                  type="email"
+                  value={authEmail}
+                  onChange={(e) => setAuthEmail(e.target.value)}
+                  placeholder="user@novasound.example"
+                  className="w-full px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-emerald-500"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-300 mb-1">Password</label>
+                <input
+                  type="password"
+                  value={authPassword}
+                  onChange={(e) => setAuthPassword(e.target.value)}
+                  placeholder="••••••••"
+                  className="w-full px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-emerald-500"
+                />
+              </div>
+
+              <div className="flex items-center justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowAuthModal(false)
+                    setAuthError(null)
+                  }}
+                  className="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-750 text-xs text-slate-300 transition cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={authLoading}
+                  className="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-xs font-semibold text-white transition cursor-pointer flex items-center gap-1.5"
+                >
+                  {authLoading ? (
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <UserCheck className="w-3.5 h-3.5" />
+                  )}
+                  <span>Sign In</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
       {/* Footer */}
       <footer className="border-t border-slate-800/80 py-4 px-6 text-xs text-slate-400 bg-slate-900/30">
         <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-2">
           <span>Inkloom AI &copy; 2026. Brand Governance & Content Policy Auditor.</span>
-          <span>Deterministic Policy Auditor + Complete Human Review Lifecycle</span>
+          <span>Deterministic Rule Engine &bull; Gemini Contextual AI &bull; Human Review State Machine</span>
         </div>
       </footer>
     </div>

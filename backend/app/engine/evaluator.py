@@ -15,7 +15,8 @@ from .demo_data import DEMO_BRAND_RULES
 def run_deterministic_review(text: str, rules: BrandRulesConfig = None) -> ReviewResponse:
     """Execute complete deterministic brand governance evaluation on submitted text."""
     if rules is None:
-        rules = DEMO_BRAND_RULES
+        from .rules_service import get_active_brand_rules
+        rules = get_active_brand_rules()
 
     # Handle empty or whitespace-only text
     if not text or not text.strip():
@@ -75,4 +76,7 @@ def run_deterministic_review(text: str, rules: BrandRulesConfig = None) -> Revie
         is_compliant=is_compliant,
         brand_name=rules.brand_name,
         is_demo_data=rules.is_demo,
+        ai_status="not_requested",
+        deterministic_count=len(all_findings),
+        ai_count=0,
     )

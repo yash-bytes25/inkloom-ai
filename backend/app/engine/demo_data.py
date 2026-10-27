@@ -13,6 +13,8 @@ from ..models.rules import (
 
 DEMO_BRAND_RULES = BrandRulesConfig(
     brand_name="NovaSound Audio (Demo Data)",
+    description="NovaSound Audio is a premier acoustic engineering brand dedicated to studio-grade fidelity, Active Acoustic Isolation™, and aerospace-grade construction.",
+    voice_and_tone="Sophisticated, authoritative, acoustically technical, and refined. Never colloquial, combative, sensationalist, or cheapening.",
     is_demo=True,
     prohibited_terms=[
         ProhibitedTermRule(
